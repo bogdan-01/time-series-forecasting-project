@@ -1,0 +1,228 @@
+
+
+
+```{r, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(tsibbledata)
+library(fable)
+library(fabletools)
+```
+
+
+```{r}
+head(nyc_bikes)
+```
+
+
+#### I'll be working on the nyc_bikes dataset available in the tsibbledata package. I'll have an initial look at it to see what I’m working with. I'll also create three new columns: one that stores only the year the bike was used, one that stores only the month the bike was used, and one that stores the date. I'll use the data stored in start_time to create these new columns.
+
+```{r}
+nyc_bikes_date <- nyc_bikes %>%
+  mutate(year_bike_used = year(start_time),
+         month_bike_used = month(start_time),
+         date_bike_used = date(start_time))
+head(nyc_bikes_date) 
+```
+
+
+#### I'll summarise the number of bike hire counts by month and make a plot of this data. However, In order to group time series (tsibble) data, I'll need to use index_by instead of group_by before I use the summarise function.
+
+
+```{r}
+nyc_bikes_date %>%
+  index_by(month_bike_used) %>%
+  summarise(monthly_bike_counts = sum(month_bike_used)) %>%
+ggplot(aes(x = month_bike_used, y = monthly_bike_counts)) +
+  scale_x_continuous(breaks = seq(12)) +
+  geom_line()
+```
+
+
+> The problem is we only have data for 1 year, and the data appears to be seasonal, with the bikes being used more in warm months (we assume that by month number). We could use a seasonal naive model potentially but we only have 12 data points here so it would not make much sense.
+
+
+
+#### I will now summarise the number of bike hire counts by date and make a plot of this new aggregated data.
+
+
+```{r}
+nyc_bikes_date_summarised <- nyc_bikes_date %>%
+  index_by(date_bike_used) %>%
+  summarise(bikes_hired = n())
+
+ggplot(nyc_bikes_date_summarised) +
+  aes(x = date_bike_used, y = bikes_hired) +
+  geom_line()
+```
+
+> This date aggregation data would be preferable as we have more of it. I have filtered the data to show each day of the year and we can clearly see it reflects the trend in the previous plot (by month) but we have more data to work with and thus better for creating a forecast.
+
+
+#### I'll start building a model. I will test the NAIVE, MEAN, and SNAIVE forecasting models models.
+
+
+```{r}
+# select variables I need and build model
+
+bikes <- nyc_bikes_date_summarised %>%
+  index_by(date_bike_used) %>%
+  summarise(daily_bike_counts = n())
+
+fit <- bikes %>%
+  model(
+    snaive = SNAIVE(daily_bike_counts),
+    mean_model = MEAN(daily_bike_counts),
+    naive = NAIVE(daily_bike_counts)
+  )
+
+```
+
+
+```{r}
+# we get the error for data containing implicit gaps in the time series. Let's see where these are.
+scan_gaps(bikes)
+```
+
+
+```{r}
+# gaps foundthroughout the series on 18 different days of the year. that is almost 3 weeks out of 52 so we can fill with the mean of the last observed value as the dates are not continuous, they are spread throughout the year. 
+
+nyc_bikes_date_fill <- nyc_bikes_date_summarised %>%
+  fill_gaps(bikes_hired = as.integer(median(bikes_hired)))
+head(nyc_bikes_date_fill)
+```
+
+
+```{r}
+filled_fit <- nyc_bikes_date_fill %>%
+   model(
+    snaive = SNAIVE(bikes_hired),
+    mean_model = MEAN(bikes_hired),
+    naive = NAIVE(bikes_hired)
+  )
+filled_fit
+```
+
+
+
+
+#### I will now build a forecast based on the above fit in order to predict bike use over the next four months. 
+
+```{r}
+forecast_4_month <- filled_fit %>%
+  fabletools::forecast(h = 30*4)
+forecast_4_month
+```
+
+```{r}
+forecast_4_month %>%
+  autoplot(nyc_bikes_date_fill) +
+  ggtitle("Four month forecast for bike hires") +
+  xlab("Day") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+
+```{r}
+# Too much clutter above so I will set level = NULL to show no predition intervals.
+forecast_4_month %>%
+  autoplot(nyc_bikes_date_fill, level = NULL) +
+  ggtitle("Four month forecast for bike hires") +
+  xlab("Day") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+
+
+#### I will now test the model accuracy by choosing a training dataset from my main dataset, building a forecast on the training set and then plotting the training set forecast against the real data. I'll then calculate the model accuracy.
+
+
+
+```{r}
+# check how many days I have in the dataset so I know what to choose for the training dataset
+
+nyc_bikes_date_fill %>%
+  distinct(date_bike_used) #365 which includes the 18 filled ones
+```
+
+
+
+```{r}
+#build training set. I chose 73 days which is 20% of 365
+train <- nyc_bikes_date_fill %>%
+  mutate(day = day(date_bike_used)) %>%
+  filter_index("2018-05-01" ~ "2018-06-22")
+
+fit_test <- train %>%
+  model(mean_model = MEAN(bikes_hired),
+        naive = NAIVE(bikes_hired),
+        snaive = SNAIVE(bikes_hired))
+fit_test
+```
+
+
+```{r}
+#build forecast from the training set
+forecast_test <- fit_test %>% 
+  fabletools::forecast(h = 120)
+
+#plot forecast against actual values
+forecast_test %>%
+  autoplot(train, level = NULL) +
+    autolayer(filter_index(nyc_bikes_date_fill, "194" ~ .), color = "black") +
+    ggtitle("Four month bike hire forecast") +
+    xlab("Day") + ylab("bike_hires") +
+    guides(colour=guide_legend(title="Forecast"))
+```
+
+
+```{r}
+model_accuracy <- fabletools::accuracy(forecast_test, nyc_bikes_date_fill)
+model_accuracy
+```
+
+> According to the mode accuracry calculated above, the mean_mode has the least error, as seen by the RMSE (root mean square error), MAE (mean absolute error) etc. However, it still doesn't seem like a good model. None of them do actually. One way to solve this is to gather more data and use the models on that. I would ask for at least three years of data before doing any comprehensive analysis and forecasting. There might be a model out there which might do better, but these are the ones I have chosen to work with on this project.
+
+
+
+
+#### I'll now make a simple graph which plots the start longitude and latitudes of each bike and create a separate facet for each bike_id.
+
+
+
+```{r}
+library(ggplot2)
+
+nyc_bikes_date %>%
+  select(bike_id, start_time, start_lat, start_long, end_lat, end_long) %>%
+  mutate(month = month(start_time, label = TRUE)) %>%
+ggplot(aes(x = start_lat, y = start_long, colour = month)) +
+  geom_point() +
+  facet_wrap(~ bike_id, ncol = 3)
+
+```
+
+
+> This plot clearly shows the bikes which were more often used in months 1-4 i.e. darker months, but also gives a general idea of how most of the other bikes were used throughout the rest the year
+
+
+
+#### I will now create an interactive leaflet plot which plots the start points of the bikes.
+
+```{r, message=FALSE}
+library(leaflet)
+```
+
+
+```{r}
+leaflet(nyc_bikes_date) %>%
+  addTiles() %>% # I tried using another map with the follwoing code
+  #addProviderTiles(providers$CartoDB.Positron) but it crashed. It was a cool one.
+  addMarkers(lng=-74.0060, lat=40.7128,
+             popup="New York City") %>%
+  addMarkers(lng = ~start_long, lat = ~start_lat, popup = ~bike_id)
+```
+
+
